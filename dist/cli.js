@@ -22,6 +22,6 @@ var log = function log(obj) {
     return obj;
 };
 
-(0, _index.traceModuleTree)('.').then(_index.fromCache).then(_index.augmentModuleTree).then(_index.toCache).then(_index.pruneModuleTree).then(_index.generateConfig)
+(0, _index.traceModuleTree)('.').then(_index.filterDevDependencies).then(_index.fromCache).then(_index.augmentModuleTree).then(_index.toCache).then(_index.pruneModuleTree).then(_index.generateConfig)
 // .then(log)
 .then(_index.serializeConfig).then(pfs.writeFile.bind(null, './generated.config.js'));

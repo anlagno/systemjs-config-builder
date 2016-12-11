@@ -17,6 +17,8 @@ var _require = require('jspm-npm/lib/node-conversion'),
 var _require2 = require('util'),
     inspect = _require2.inspect;
 
+var semver = require('semver');
+
 var nodeCoreModules = exports.nodeCoreModules = ['assert', 'buffer', 'child_process', 'cluster', 'console', 'constants', 'crypto', 'dgram', 'dns', 'domain', 'events', 'fs', 'http', 'https', 'module', 'net', 'os', 'path', 'process', 'punycode', 'querystring', 'readline', 'repl', 'stream', 'string_decoder', 'sys', 'timers', 'tls', 'tty', 'url', 'util', 'vm', 'zlib'];
 
 var pfs = {};
@@ -150,7 +152,22 @@ var traceModuleTree = exports.traceModuleTree = function traceModuleTree(directo
     .then(function (_ref) {
         var name = _ref.name,
             version = _ref.version;
-        return !name || !version ? getPackageConfig(directory) : { name: name, version: version };
+
+        if (!name || !version) {
+            // Always add the target module to registry
+            return getPackageConfig(directory).then(function (dep) {
+                var versionName = dep.name + '@' + dep.version;
+                registry[versionName] = {
+                    name: dep.name,
+                    config: dep,
+                    key: versionName,
+                    location: path.join(directory)
+                };
+                return Promise.resolve({ name: dep.name, version: dep.version });
+            });
+        } else {
+            return Promise.resolve({ name: name, version: version });
+        }
     }).then(function (_ref2) {
         var name = _ref2.name,
             version = _ref2.version;
@@ -194,6 +211,49 @@ var traceModuleTree = exports.traceModuleTree = function traceModuleTree(directo
                 return { tree: tree, registry: registry };
             })
         );
+    });
+};
+
+var filterDevDependencies = exports.filterDevDependencies = function filterDevDependencies(_ref5) {
+    var tree = _ref5.tree,
+        registry = _ref5.registry;
+
+    var filteredRegistry = {};
+    var filteredTree = {
+        name: tree['name'],
+        version: tree['version'],
+        deps: []
+    };
+    return Promise.resolve({ tree: tree, registry: registry, filteredTree: filteredTree, filteredRegistry: filteredRegistry }).then(function (_ref6) {
+        var tree = _ref6.tree,
+            registry = _ref6.registry,
+            filteredTree = _ref6.filteredTree,
+            filteredRegistry = _ref6.filteredRegistry;
+
+        var target = tree['name'] + '@' + tree['version'];
+        var item = registry[target];
+
+        filterDependencies(item.config, tree, registry, filteredTree, filteredRegistry, ['dependencies', 'peerDependencies']);
+        return { tree: filteredTree, registry: filteredRegistry };
+    });
+};
+
+var filterDependencies = function filterDependencies(item, tree, registry, filteredTree, filteredRegistry, dependencyType) {
+    dependencyType.forEach(function (type) {
+        var depends = item[type];
+        Object.keys(depends).forEach(function (dep) {
+            var found = _(tree.deps).thru(function (col) {
+                return _.union(col, _.map(col, 'deps'));
+            }).flatten().find(function (o) {
+                return !_.includes(nodeCoreModules, dep) && o.name === dep && semver.satisfies(o.version, depends[dep]);
+            });
+            if (found) {
+                filteredTree['deps'].push(found);
+                var versionName = found.name + '@' + found.version;
+                filteredRegistry[versionName] = registry[versionName];
+                filterDependencies(registry[versionName].config, tree, registry, filteredTree, filteredRegistry, dependencyType);
+            }
+        });
     });
 };
 
@@ -256,9 +316,9 @@ var augmentRegistry = exports.augmentRegistry = function augmentRegistry(registr
  * @param tree
  * @param registry
  */
-var augmentModuleTree = exports.augmentModuleTree = function augmentModuleTree(_ref5) {
-    var tree = _ref5.tree,
-        registry = _ref5.registry;
+var augmentModuleTree = exports.augmentModuleTree = function augmentModuleTree(_ref7) {
+    var tree = _ref7.tree,
+        registry = _ref7.registry;
     return augmentRegistry(registry).then(function (registry) {
         return { tree: tree, registry: registry };
     });
@@ -282,9 +342,9 @@ var pruneRegistry = exports.pruneRegistry = function pruneRegistry(registry) {
  * @param tree
  * @param registry
  */
-var pruneModuleTree = exports.pruneModuleTree = function pruneModuleTree(_ref6) {
-    var tree = _ref6.tree,
-        registry = _ref6.registry;
+var pruneModuleTree = exports.pruneModuleTree = function pruneModuleTree(_ref8) {
+    var tree = _ref8.tree,
+        registry = _ref8.registry;
     return pruneRegistry(registry).then(function (registry) {
         return { tree: tree, registry: registry };
     });
@@ -298,9 +358,9 @@ var pruneModuleTree = exports.pruneModuleTree = function pruneModuleTree(_ref6) 
  * @param depth - How deep should we go
  * @param skip - How many levels should we skip
  */
-var walkTree = exports.walkTree = function walkTree(_ref7, f) {
-    var tree = _ref7.tree,
-        registry = _ref7.registry;
+var walkTree = exports.walkTree = function walkTree(_ref9, f) {
+    var tree = _ref9.tree,
+        registry = _ref9.registry;
     var depth = arguments.length > 2 && arguments[2] !== undefined ? arguments[2] : Infinity;
     var skip = arguments.length > 3 && arguments[3] !== undefined ? arguments[3] : 0;
 
@@ -309,8 +369,9 @@ var walkTree = exports.walkTree = function walkTree(_ref7, f) {
             deps = tree.deps,
             version = tree.version;
 
-
-        if (skip <= 0) f(registry[name + '@' + version], deps, tree);
+        if (skip <= 0) {
+            if (!registry[name + '@' + version]) console.log('Cant find module [' + name + '@' + version + '], Perhaps the depth tree walk was too shallow?');else f(registry[name + '@' + version], deps, tree);
+        }
 
         if (depth >= 2) deps.forEach(function (tree) {
             return walkTree({ tree: tree, registry: registry }, f, depth - 1, skip - 1);
@@ -328,9 +389,9 @@ var walkTree = exports.walkTree = function walkTree(_ref7, f) {
  * @param registry
  * @returns {Promise.<{map: {}, packages: {}}>}
  */
-var generateConfig = exports.generateConfig = function generateConfig(_ref8) {
-    var tree = _ref8.tree,
-        registry = _ref8.registry;
+var generateConfig = exports.generateConfig = function generateConfig(_ref10) {
+    var tree = _ref10.tree,
+        registry = _ref10.registry;
 
 
     var systemConfig = {
@@ -343,21 +404,21 @@ var generateConfig = exports.generateConfig = function generateConfig(_ref8) {
     systemConfig['map']["_stream_transform"] = "node_modules/readable-stream/transform";
 
     // Walk first level of dependencies and map package name to location
-    walkTree({ tree: tree, registry: registry }, function (_ref9, deps) {
-        var name = _ref9.name,
-            config = _ref9.config,
-            key = _ref9.key,
-            location = _ref9.location;
+    walkTree({ tree: tree, registry: registry }, function (_ref11, deps) {
+        var name = _ref11.name,
+            config = _ref11.config,
+            key = _ref11.key,
+            location = _ref11.location;
 
         systemConfig['map'][name] = location;
     }, 2, 1);
 
     // Walk full dep tree and assign package config entries
-    walkTree({ tree: tree, registry: registry }, function (_ref10, deps, tree) {
-        var name = _ref10.name,
-            config = _ref10.config,
-            key = _ref10.key,
-            location = _ref10.location;
+    walkTree({ tree: tree, registry: registry }, function (_ref12, deps, tree) {
+        var name = _ref12.name,
+            config = _ref12.config,
+            key = _ref12.key,
+            location = _ref12.location;
 
 
         // Construct package entry based off config
@@ -367,11 +428,11 @@ var generateConfig = exports.generateConfig = function generateConfig(_ref8) {
         }, config);
 
         // Add mappings for it's deps.
-        walkTree({ tree: tree, registry: registry }, function (_ref11, deps) {
-            var name = _ref11.name,
-                config = _ref11.config,
-                key = _ref11.key,
-                location = _ref11.location;
+        walkTree({ tree: tree, registry: registry }, function (_ref13, deps) {
+            var name = _ref13.name,
+                config = _ref13.config,
+                key = _ref13.key,
+                location = _ref13.location;
 
             packageEntry['map'][name] = location;
         }, 2, 1);
@@ -416,9 +477,9 @@ var mergeCache = exports.mergeCache = function mergeCache(registry, cachedRegist
     return Object.assign({}, registry, cachedRegistry);
 };
 
-var fromCache = exports.fromCache = function fromCache(_ref12) {
-    var tree = _ref12.tree,
-        registry = _ref12.registry;
+var fromCache = exports.fromCache = function fromCache(_ref14) {
+    var tree = _ref14.tree,
+        registry = _ref14.registry;
 
     return dehydrateCache().then(function (cachedRegistry) {
         return { tree: tree, registry: mergeCache(registry, cachedRegistry) };
@@ -431,9 +492,9 @@ var fromCache = exports.fromCache = function fromCache(_ref12) {
  * @param registry
  * @returns {Promise.<{tree: *, registry: *}>}
  */
-var toCache = exports.toCache = function toCache(_ref13) {
-    var tree = _ref13.tree,
-        registry = _ref13.registry;
+var toCache = exports.toCache = function toCache(_ref15) {
+    var tree = _ref15.tree,
+        registry = _ref15.registry;
 
     return hydrateCache(registry).then(function () {
         return { tree: tree, registry: registry };
