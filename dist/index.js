@@ -21,6 +21,8 @@ var semver = require('semver');
 
 var nodeCoreModules = exports.nodeCoreModules = ['assert', 'buffer', 'child_process', 'cluster', 'console', 'constants', 'crypto', 'dgram', 'dns', 'domain', 'events', 'fs', 'http', 'https', 'module', 'net', 'os', 'path', 'process', 'punycode', 'querystring', 'readline', 'repl', 'stream', 'string_decoder', 'sys', 'timers', 'tls', 'tty', 'url', 'util', 'vm', 'zlib'];
 
+var nodeJspmModules = {};
+
 var pfs = {};
 
 /**
@@ -208,7 +210,7 @@ var traceModuleTree = exports.traceModuleTree = function traceModuleTree(directo
                     return { name: name, deps: deps, version: version };
                 });
             }).then(function (tree) {
-                return { tree: tree, registry: registry };
+                return { tree: tree, registry: registry, directory: directory };
             })
         );
     });
@@ -216,7 +218,8 @@ var traceModuleTree = exports.traceModuleTree = function traceModuleTree(directo
 
 var filterDevDependencies = exports.filterDevDependencies = function filterDevDependencies(_ref5) {
     var tree = _ref5.tree,
-        registry = _ref5.registry;
+        registry = _ref5.registry,
+        directory = _ref5.directory;
 
     var filteredRegistry = {};
     var filteredTree = {
@@ -224,17 +227,18 @@ var filterDevDependencies = exports.filterDevDependencies = function filterDevDe
         version: tree['version'],
         deps: []
     };
-    return Promise.resolve({ tree: tree, registry: registry, filteredTree: filteredTree, filteredRegistry: filteredRegistry }).then(function (_ref6) {
+    return Promise.resolve({ tree: tree, registry: registry, filteredTree: filteredTree, filteredRegistry: filteredRegistry, directory: directory }).then(function (_ref6) {
         var tree = _ref6.tree,
             registry = _ref6.registry,
             filteredTree = _ref6.filteredTree,
-            filteredRegistry = _ref6.filteredRegistry;
+            filteredRegistry = _ref6.filteredRegistry,
+            directory = _ref6.directory;
 
         var target = tree['name'] + '@' + tree['version'];
         var item = registry[target];
 
         filterDependencies(item.config, tree, registry, filteredTree, filteredRegistry, ['dependencies', 'peerDependencies']);
-        return { tree: filteredTree, registry: filteredRegistry };
+        return { tree: filteredTree, registry: filteredRegistry, directory: directory };
     });
 };
 
@@ -245,13 +249,21 @@ var filterDependencies = function filterDependencies(item, tree, registry, filte
             var found = _(tree.deps).thru(function (col) {
                 return _.union(col, _.map(col, 'deps'));
             }).flatten().find(function (o) {
-                return !_.includes(nodeCoreModules, dep) && o.name === dep && semver.satisfies(o.version, depends[dep]);
+                return !_.includes(nodeCoreModules, dep) && o.name === dep && semver.satisfies(o.version, depends[dep]) || o.name.startsWith('jspm-nodelibs') && o.name === dep;
             });
             if (found) {
-                filteredTree['deps'].push(found);
-                var versionName = found.name + '@' + found.version;
-                filteredRegistry[versionName] = registry[versionName];
-                filterDependencies(registry[versionName].config, tree, registry, filteredTree, filteredRegistry, dependencyType);
+                (function () {
+                    filteredTree['deps'].push(found);
+                    var versionName = found.name + '@' + found.version;
+                    // We track the jspm shims so we can access them from the registry during systemjs config generation
+                    if (found.name.startsWith('jspm-nodelibs')) {
+                        nodeJspmModules[found.name] = found.version;
+                    }
+                    filteredRegistry[versionName] = registry[versionName];
+                    setTimeout(function () {
+                        filterDependencies(registry[versionName].config, tree, registry, filteredTree, filteredRegistry, dependencyType);
+                    }, 0);
+                })();
             }
         });
     });
@@ -305,7 +317,7 @@ var augmentRegistry = exports.augmentRegistry = function augmentRegistry(registr
         if (depMap.config.jspm !== undefined && depMap.config.jspm.jspmNodeConversion !== undefined && !depMap.config.jspm.jspmNodeConversion) shouldAugment = false;
 
         // Augment the package.json
-        return shouldAugment ? convertPackage(depMap.config, ':' + key, './' + depMap.location, console).then(function (config) {
+        return shouldAugment ? convertPackage(depMap.config, ':' + key, depMap.location, console).then(function (config) {
             return Object.assign(depMap, { config: config, augmented: true });
         }).catch(log) : depMap;
     })).then(objectify.bind(null, 'key'));
@@ -318,9 +330,10 @@ var augmentRegistry = exports.augmentRegistry = function augmentRegistry(registr
  */
 var augmentModuleTree = exports.augmentModuleTree = function augmentModuleTree(_ref7) {
     var tree = _ref7.tree,
-        registry = _ref7.registry;
+        registry = _ref7.registry,
+        directory = _ref7.directory;
     return augmentRegistry(registry).then(function (registry) {
-        return { tree: tree, registry: registry };
+        return { tree: tree, registry: registry, directory: directory };
     });
 };
 
@@ -344,9 +357,10 @@ var pruneRegistry = exports.pruneRegistry = function pruneRegistry(registry) {
  */
 var pruneModuleTree = exports.pruneModuleTree = function pruneModuleTree(_ref8) {
     var tree = _ref8.tree,
-        registry = _ref8.registry;
+        registry = _ref8.registry,
+        directory = _ref8.directory;
     return pruneRegistry(registry).then(function (registry) {
-        return { tree: tree, registry: registry };
+        return { tree: tree, registry: registry, directory: directory };
     });
 };
 
@@ -379,6 +393,16 @@ var walkTree = exports.walkTree = function walkTree(_ref9, f) {
     }
 };
 
+_.mixin({
+    deeply: function deeply(map) {
+        return function (obj, fn) {
+            return map(_.mapValues(obj, function (v) {
+                return _.isPlainObject(v) ? _.deeply(map)(v, fn) : v;
+            }), fn);
+        };
+    }
+});
+
 /**
  * Use the tree and registry to create a SystemJS config
  *
@@ -391,7 +415,8 @@ var walkTree = exports.walkTree = function walkTree(_ref9, f) {
  */
 var generateConfig = exports.generateConfig = function generateConfig(_ref10) {
     var tree = _ref10.tree,
-        registry = _ref10.registry;
+        registry = _ref10.registry,
+        directory = _ref10.directory;
 
 
     var systemConfig = {
@@ -446,7 +471,10 @@ var generateConfig = exports.generateConfig = function generateConfig(_ref10) {
         // Add mappings for all jspm-nodelibs
         // TODO: Fix this hack
         nodeCoreModules.forEach(function (lib) {
-            systemConfig['map'][lib] = "node_modules/jspm-nodelibs-" + lib;
+            var jspmNodelibVersion = nodeJspmModules['jspm-nodelibs-' + lib];
+            if (jspmNodelibVersion != undefined) {
+                systemConfig['map'][lib] = registry['jspm-nodelibs-' + lib + '@' + jspmNodelibVersion].location;
+            }
         });
     }, Infinity, 1);
 
@@ -469,7 +497,20 @@ var generateConfig = exports.generateConfig = function generateConfig(_ref10) {
         }
     });
 
-    return Promise.resolve(systemConfig);
+    // TODO: double object walk is really hacky...
+    var mySystemConfig = _.deeply(_.mapValues)(systemConfig, function (val, key) {
+        if (typeof val === 'string' || val instanceof String) {
+            return _.replace(val, path.join(directory, 'node_modules' + path.sep), 'nm:');
+        } else {
+            return val;
+        }
+    });
+
+    mySystemConfig = _.deeply(_.mapKeys)(mySystemConfig, function (val, key) {
+        return _.replace(key, path.join(directory, 'node_modules' + path.sep), 'nm:');
+    });
+
+    return Promise.resolve(mySystemConfig);
 };
 
 // TODO: This needs to be done better (fails if locations of shit changes)
@@ -479,10 +520,11 @@ var mergeCache = exports.mergeCache = function mergeCache(registry, cachedRegist
 
 var fromCache = exports.fromCache = function fromCache(_ref14) {
     var tree = _ref14.tree,
-        registry = _ref14.registry;
+        registry = _ref14.registry,
+        directory = _ref14.directory;
 
     return dehydrateCache().then(function (cachedRegistry) {
-        return { tree: tree, registry: mergeCache(registry, cachedRegistry) };
+        return { tree: tree, registry: mergeCache(registry, cachedRegistry), directory: directory };
     });
 };
 
@@ -494,10 +536,11 @@ var fromCache = exports.fromCache = function fromCache(_ref14) {
  */
 var toCache = exports.toCache = function toCache(_ref15) {
     var tree = _ref15.tree,
-        registry = _ref15.registry;
+        registry = _ref15.registry,
+        directory = _ref15.directory;
 
     return hydrateCache(registry).then(function () {
-        return { tree: tree, registry: registry };
+        return { tree: tree, registry: registry, directory: directory };
     });
 };
 
